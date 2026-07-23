@@ -1,0 +1,1 @@
+select f_name from fruit except select inv_name from inventory;

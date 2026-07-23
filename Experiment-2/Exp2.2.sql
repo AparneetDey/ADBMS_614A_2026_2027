@@ -1,0 +1,1 @@
+select emp_name from Employee union all select emp_name from pt_employee;image.png
