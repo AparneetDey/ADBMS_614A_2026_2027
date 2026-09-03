@@ -1,6 +1,10 @@
-create view Unsold_Items
-as
-select p.product_name, p.catergory from products p
-left join order_details o
-on p.order_detail = o.order_id
-where o.order_id is null;
+CREATE VIEW Unsold_Items AS
+SELECT ProductName, Category
+FROM Products p
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM Order_Details od
+    WHERE p.ProductID = od.ProductID
+);
+
+select *from Unsold_Items
