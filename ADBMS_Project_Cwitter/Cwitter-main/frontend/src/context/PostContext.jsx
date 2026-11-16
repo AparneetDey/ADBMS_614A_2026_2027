@@ -1,0 +1,440 @@
+import React, { createContext, useContext, useState, useCallback } from 'react';
+import api from '../utils/axiosApi.util';
+import { useAuth } from './AuthContext';
+import VerificationModal from '../components/profile/VerificationModal';
+import uploadToImageKit from '../utils/imageKit';
+import { useRef } from 'react';
+
+const PostContext = createContext(null);
+
+export const PostProvider = ({ children }) => {
+  const { user } = useAuth();
+  const [feedRefreshKey, setFeedRefreshKey] = useState(0);
+  const [isVerificationModalOpen, setIsVerificationModalOpen] = useState(false);
+
+  const triggerToast = (showToast, message) => {
+    if (showToast && typeof showToast === 'function') {
+      showToast(message);
+    }
+  };
+
+  const openVerificationModal = useCallback(() => {
+    setIsVerificationModalOpen(true);
+  }, []);
+
+  const closeVerificationModal = useCallback(() => {
+    setIsVerificationModalOpen(false);
+  }, []);
+
+  // Signal home feed / stream refresh
+  const refreshFeed = useCallback(() => {
+    setFeedRefreshKey((prev) => prev + 1);
+  }, []);
+
+  // Create Post Action in Context (Checks isVerified & handles 401 unverified error)
+  const createPost = useCallback(async (content, rawMedia = [], showToast = null) => {
+
+    if (!content || !content.trim()) return null;
+
+    if (!user?.isVerified) {
+      triggerToast(showToast, 'Account verification required to create posts.');
+      openVerificationModal();
+      return null;
+    }
+
+    try {
+      const mediaUrls = [];
+
+      // If raw File objects are passed, upload them to ImageKit when creating the tweet
+      if (Array.isArray(rawMedia) && rawMedia.length > 0) {
+        for (const item of rawMedia) {
+          const fileToUpload = item instanceof File ? item : (item?.file instanceof File ? item.file : null);
+          if (fileToUpload) {
+            try {
+              const res = await uploadToImageKit(fileToUpload);
+              if (res?.url) {
+                mediaUrls.push(res.url);
+              }
+            } catch (uErr) {
+              console.warn("Failed to upload file to ImageKit:", uErr);
+            }
+          } else if (typeof item === 'string' && item.startsWith('http')) {
+            mediaUrls.push(item);
+          }
+        }
+      }
+
+      const res = await api.post('/tweets/', { content: content.trim(), media: mediaUrls });
+      const createdTweet = res?.data?.data;
+
+      // Register Media document entries via Media API controller
+      if (createdTweet?._id && mediaUrls.length > 0) {
+        for (const url of mediaUrls) {
+          try {
+            await api.post(`/medias/add/${createdTweet._id}`, { url });
+          } catch (mErr) {
+            console.warn('Failed to register media doc:', mErr);
+          }
+        }
+      }
+
+      triggerToast(showToast, 'Your post was sent!');
+      refreshFeed();
+      return createdTweet;
+    } catch (error) {
+      const msg = error?.response?.data?.message || 'Failed to create post';
+      if (msg.includes('not verified') || error?.response?.status === 401) {
+        triggerToast(showToast, 'Account verification required to create posts.');
+        openVerificationModal();
+      } else {
+        triggerToast(showToast, msg);
+      }
+      throw error;
+    }
+  }, [user, openVerificationModal, refreshFeed]);
+
+  // Edit Post Action in Context (Supports media additions and removals)
+  const editPost = useCallback(async (postId, newContent, mediaItems = [], removedUrls = [], showToast = null) => {
+    if (!postId) return;
+
+    if (!user?.isVerified) {
+      triggerToast(showToast, 'Account verification required to edit posts.');
+      openVerificationModal();
+      return;
+    }
+
+    try {
+      const finalMediaUrls = [];
+
+      // Upload any newly added raw File objects to ImageKit upon saving
+      if (Array.isArray(mediaItems) && mediaItems.length > 0) {
+        for (const item of mediaItems) {
+          if (item?.isNew && item?.file instanceof File) {
+            try {
+              const res = await uploadToImageKit(item.file);
+              if (res?.url) {
+                finalMediaUrls.push(res.url);
+                // Call addAMedia API controller endpoint
+                try {
+                  await api.post(`/medias/add/${postId}`, { url: res.url });
+                } catch (mErr) {
+                  console.warn("Failed to register added media:", mErr);
+                }
+              }
+            } catch (uErr) {
+              console.warn("Failed to upload new media file to ImageKit:", uErr);
+            }
+          } else if (item?.url && typeof item.url === 'string') {
+            finalMediaUrls.push(item.url);
+          } else if (typeof item === 'string') {
+            finalMediaUrls.push(item);
+          }
+        }
+      }
+
+      // Invoke deleteAMedia API controller endpoint for removed media URLs
+      if (Array.isArray(removedUrls) && removedUrls.length > 0) {
+        for (const url of removedUrls) {
+          try {
+            await api.delete(`/medias/delete/media/${encodeURIComponent(url)}`);
+          } catch (dErr) {
+            console.warn("Failed to delete removed media:", dErr);
+          }
+        }
+      }
+
+      // Update tweet content & media array on backend
+      const res = await api.patch(`/tweets/edit/${postId}`, {
+        content: newContent ? newContent.trim() : "",
+        media: finalMediaUrls
+      });
+
+      triggerToast(showToast, res?.data?.message || 'Post updated successfully!');
+      refreshFeed();
+      return res?.data?.data;
+    } catch (error) {
+      const msg = error?.response?.data?.message || 'Failed to edit post';
+      if (msg.includes('not verified')) {
+        triggerToast(showToast, 'Account verification required to edit posts.');
+        openVerificationModal();
+      } else {
+        triggerToast(showToast, msg);
+      }
+      throw error;
+    }
+  }, [user, openVerificationModal, refreshFeed]);
+
+  // Delete Post Action in Context
+  const deletePost = useCallback(async (postId, setPosts, showToast) => {
+    if (!user?.isVerified) {
+      triggerToast(showToast, 'Account verification required to delete posts.');
+      openVerificationModal();
+      return;
+    }
+
+    if (setPosts) {
+      setPosts((prevPosts) =>
+        prevPosts
+          ? prevPosts.filter((post) => String(post._id || post.id) !== String(postId))
+          : prevPosts
+      );
+    }
+
+    try {
+      const res = await api.delete(`/tweets/delete/${postId}`);
+      triggerToast(showToast, res?.data?.message || 'Post deleted successfully');
+      refreshFeed();
+    } catch (error) {
+      const msg = error?.response?.data?.message || 'Failed to delete post';
+      if (msg.includes('not verified')) {
+        triggerToast(showToast, 'Account verification required to delete posts.');
+        openVerificationModal();
+      } else {
+        triggerToast(showToast, msg);
+      }
+    }
+  }, [user, openVerificationModal, refreshFeed]);
+
+  // Toggle Like Action (optimistic UI update + API endpoint call with verification check)
+  const toggleLike = useCallback(async (postId, setPosts, showToast = null) => {
+    if (!user?.isVerified) {
+      triggerToast(showToast, 'Account verification required to like posts.');
+      openVerificationModal();
+      return;
+    }
+
+    let nextLikedState = false;
+
+    if (setPosts) {
+      setPosts((prevPosts) =>
+        prevPosts
+          ? prevPosts.map((post) => {
+              const id = post._id || post.id;
+              if (String(id) === String(postId)) {
+                nextLikedState = !post.isLiked;
+                const currentLikes =
+                  typeof post.totalLikes === 'number'
+                    ? post.totalLikes
+                    : typeof post.likes === 'number'
+                    ? post.likes
+                    : Array.isArray(post.likes)
+                    ? post.likes.length
+                    : 0;
+
+                const nextLikes = nextLikedState ? currentLikes + 1 : Math.max(0, currentLikes - 1);
+
+                return {
+                  ...post,
+                  isLiked: nextLikedState,
+                  totalLikes: nextLikes,
+                  likes: nextLikes,
+                };
+              }
+              return post;
+            })
+          : prevPosts
+      );
+    }
+
+    try {
+      const res = await api.put(`/likes/tweet/${postId}`);
+      triggerToast(showToast, res?.data?.message || (nextLikedState ? 'Liked' : 'Unliked'));
+    } catch (error) {
+      // Revert optimistic update on error
+      if (setPosts) {
+        setPosts((prevPosts) =>
+          prevPosts
+            ? prevPosts.map((post) => {
+                const id = post._id || post.id;
+                if (String(id) === String(postId)) {
+                  const revertedLikedState = !nextLikedState;
+                  const currentLikes =
+                    typeof post.totalLikes === 'number'
+                      ? post.totalLikes
+                      : typeof post.likes === 'number'
+                      ? post.likes
+                      : 0;
+
+                  const revertedLikes = revertedLikedState ? currentLikes + 1 : Math.max(0, currentLikes - 1);
+
+                  return {
+                    ...post,
+                    isLiked: revertedLikedState,
+                    totalLikes: revertedLikes,
+                    likes: revertedLikes,
+                  };
+                }
+                return post;
+              })
+            : prevPosts
+        );
+      }
+
+      const msg = error?.response?.data?.message || 'Failed to toggle like';
+      if (msg.includes('not verified')) {
+        triggerToast(showToast, 'Account verification required to like posts.');
+        openVerificationModal();
+      } else {
+        triggerToast(showToast, msg);
+      }
+    }
+  }, [user, openVerificationModal]);
+
+  // Toggle Retweet Action (optimistic state toggle + API endpoint trigger with isVerified check)
+  const toggleRetweet = useCallback(async (postId, setPosts, showToast) => {
+    if (!user?.isVerified) {
+      triggerToast(showToast, 'Account verification required to retweet.');
+      openVerificationModal();
+      return;
+    }
+
+    let nextRetweetedState = false;
+
+    if (setPosts) {
+      setPosts((prevPosts) =>
+        prevPosts
+          ? prevPosts.map((post) => {
+              const id = post._id || post.id;
+              if (String(id) === String(postId)) {
+                nextRetweetedState = !post.isRetweeted;
+
+                const currentCount =
+                  typeof post.totalRetweets === 'number'
+                    ? post.totalRetweets
+                    : typeof post.retweets === 'number'
+                    ? post.retweets
+                    : Array.isArray(post.retweets)
+                    ? post.retweets.length
+                    : 0;
+
+                const nextCount = nextRetweetedState
+                  ? currentCount + 1
+                  : Math.max(0, currentCount - 1);
+
+                return {
+                  ...post,
+                  isRetweeted: nextRetweetedState,
+                  totalRetweets: nextCount,
+                  retweets: nextCount,
+                };
+              }
+              return post;
+            })
+          : prevPosts
+      );
+    }
+
+    try {
+      const res = await api.get(`/tweets/retweet/${postId}`);
+      triggerToast(showToast, res?.data?.message || (nextRetweetedState ? 'Retweeted' : 'Undo retweet'));
+    } catch (error) {
+      const msg = error?.response?.data?.message || 'Failed to toggle retweet';
+      if (msg.includes('not verified')) {
+        triggerToast(showToast, 'Account verification required to retweet.');
+        openVerificationModal();
+      } else {
+        triggerToast(showToast, msg);
+      }
+    }
+  }, [user, openVerificationModal]);
+
+  // Toggle Bookmark Action (optimistic state toggle + API endpoint trigger)
+  const toggleBookmark = useCallback(async (postId, setPosts, showToast) => {
+    let nextBookmarkedState = false;
+
+    if (setPosts) {
+      setPosts((prevPosts) =>
+        prevPosts
+          ? prevPosts.map((post) => {
+              const id = post._id || post.id;
+              if (String(id) === String(postId)) {
+                nextBookmarkedState = !post.isBookmarked;
+                return {
+                  ...post,
+                  isBookmarked: nextBookmarkedState,
+                };
+              }
+              return post;
+            })
+          : prevPosts
+      );
+    }
+
+    try {
+      const res = await api.get(`/tweets/bookmark/${postId}`);
+      const message =
+        res?.data?.message || (nextBookmarkedState ? 'Added to your Bookmarks' : 'Removed from Bookmarks');
+      triggerToast(showToast, message);
+    } catch (error) {
+      triggerToast(showToast, error?.response?.data?.message || 'Failed to toggle bookmark');
+    }
+  }, []);
+
+  // Session set of recorded reach tweet IDs to avoid duplicate API calls
+  const recordedReachSet = useRef(new Set());
+
+  // Record Reach Action (Fires backend reach endpoint silently without immediate UI mutation)
+  const recordReach = useCallback(async (postId) => {
+    if (!postId || recordedReachSet.current.has(String(postId))) return;
+
+    // Mark as recorded in current session
+    recordedReachSet.current.add(String(postId));
+
+    try {
+      await api.put(`/tweetReaches/${postId}`);
+    } catch (error) {
+      console.warn("Failed to record tweet reach:", error?.response?.data?.message || error?.message);
+    }
+  }, []);
+
+  // Share Post Action
+  const sharePost = useCallback((postId, showToast) => {
+    const postUrl = `${window.location.origin}/post/${postId}`;
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(postUrl);
+    }
+    triggerToast(showToast, 'Post link copied to clipboard!');
+  }, []);
+
+  const value = {
+    feedRefreshKey,
+    refreshFeed,
+    createPost,
+    editPost,
+    deletePost,
+    toggleLike,
+    toggleRetweet,
+    toggleBookmark,
+    recordReach,
+    sharePost,
+    isVerificationModalOpen,
+    openVerificationModal,
+    closeVerificationModal,
+  };
+
+  return (
+    <PostContext.Provider value={value}>
+      {children}
+
+      {/* Global Account Verification Modal */}
+      <VerificationModal
+        isOpen={isVerificationModalOpen}
+        onClose={closeVerificationModal}
+        user={user}
+        onVerifiedSuccess={() => {
+          triggerToast(null, 'Account verified successfully! 🎉');
+        }}
+      />
+    </PostContext.Provider>
+  );
+};
+
+export default PostProvider;
+
+export const usePost = () => {
+  const context = useContext(PostContext);
+  if (!context) {
+    throw new Error('usePost must be used within a PostProvider');
+  }
+  return context;
+};
